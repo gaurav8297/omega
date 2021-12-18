@@ -89,3 +89,9 @@ pub fn check_if_vec_equal(input: &Vec<u8>, other: &Vec<u8>) -> bool {
         .zip(other)
         .all(|(a, b)| *a == *b);
 }
+
+pub fn convert_char_to_bytes(char: char) -> [u8; 1] {
+    let mut res = [0; 1];
+    char.encode_utf8(&mut res);
+    return res;
+}

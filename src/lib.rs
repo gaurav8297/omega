@@ -7,3 +7,4 @@ pub mod zmessage;
 pub mod zre;
 pub mod zsocket;
 mod peer;
+mod transport;

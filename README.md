@@ -24,3 +24,6 @@ The ZRE protocol provides a way for a set of nodes on a local network to discove
 - To recover from transient failures in connectivity.
 - To be neutral with respect to operating system, programming language, and hardware.
 - To allow any number of nodes to run in one process, to allow large-scale simulation and testing.
+
+https://arxiv.org/pdf/1707.00788.pdf
+https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf
