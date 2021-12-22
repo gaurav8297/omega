@@ -5,6 +5,8 @@ use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
 use std::io::{Write, Read};
+use std::collections::btree_map::BTreeMap;
+use std::collections::BTreeSet;
 
 #[test]
 fn test_transport_write_to()
