@@ -1,12 +1,9 @@
-use omega::transport::{NetTransport, Transport};
-use socket2::SockAddr;
-use std::net::{SocketAddr, IpAddr, TcpStream, TcpListener};
-use std::str::FromStr;
-use std::thread;
 use std::time::Duration;
+use std::net::{TcpStream, SocketAddr};
 use std::io::{Write, Read};
-use std::collections::btree_map::BTreeMap;
-use std::collections::BTreeSet;
+use std::str::FromStr;
+
+use crate::transport::{NetTransport, Transport};
 
 #[test]
 fn test_transport_write_to()
@@ -14,7 +11,7 @@ fn test_transport_write_to()
     let addr = get_random_local_addr();
     let transport = NetTransport::new(addr).unwrap();
 
-    let data = "test data".as_bytes();
+    let data = "tests data".as_bytes();
     transport.write_to(data, addr);
 
     let result = transport.packet_channel().recv().unwrap();
@@ -45,7 +42,7 @@ fn test_transport_stream_channel()
     let addr = get_random_local_addr();
     let transport = NetTransport::new(addr).unwrap();
 
-    let data = "test data".as_bytes();
+    let data = "tests data".as_bytes();
     let mut stream = TcpStream::connect(addr).unwrap();
     stream.write(data);
 

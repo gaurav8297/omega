@@ -6,11 +6,12 @@ use std::sync::mpsc;
 use std::str::FromStr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use socket2::{Socket, Domain, Type, Protocol, SockAddr};
-use log::{info, error};
 use std::thread::JoinHandle;
 use std::mem::MaybeUninit;
 use std::io::Error;
+
+use log::{info, error};
+use socket2::{Socket, Domain, Type, Protocol, SockAddr};
 
 const UDP_PACKET_BUFFER_SIZE: usize = 10;
 const UDP_RECEIVE_BUF_SIZE: usize = 2 * 1024 * 1024;

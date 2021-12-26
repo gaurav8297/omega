@@ -1,8 +1,9 @@
-use std::collections::BTreeSet;
-use omega::queue::{LimitedBroadcast, get_max, get_min, TransmitLimitedQueue};
 use std::rc::Rc;
+use std::collections::BTreeSet;
 use std::cell::RefCell;
-use omega::broadcast::DummyBroadcast;
+
+use crate::queue::{LimitedBroadcast, TransmitLimitedQueue, get_min, get_max};
+use crate::broadcast::DummyBroadcast;
 
 #[test]
 fn test_limited_broadcast_order()

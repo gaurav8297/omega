@@ -1,4 +1,7 @@
-pub mod transport;
-pub mod queue;
+mod transport;
+mod queue;
 mod util;
-pub mod broadcast;
+mod broadcast;
+
+#[cfg(test)]
+mod tests;
