@@ -55,10 +55,10 @@ impl Broadcast for DummyBroadcast {
     }
 }
 
-struct OmegaBroadcast {
+pub struct OmegaBroadcast {
     node: String,
     msg: Vec<u8>,
-    notify: Sender<bool>
+    notify: Option<Sender<bool>>
 }
 
 impl Broadcast for OmegaBroadcast {
@@ -81,6 +81,8 @@ impl Broadcast for OmegaBroadcast {
 
     fn finished(&self)
     {
-        self.notify.send(true);
+        if self.notify.is_some() {
+            self.notify.unwrap().send(true);
+        }
     }
 }

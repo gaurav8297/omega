@@ -34,7 +34,7 @@ pub struct Address
 
 pub trait Transport
 {
-    fn find_advertise_addr(&self, addr: String) -> Result<SocketAddr, AddrParseError>;
+    fn find_advertise_addr(&self) -> io::Result<SocketAddr>;
     fn write_to_address(&self, data: &[u8], addr: Address) -> io::Result<Instant>
     {
         return self.write_to(data, addr.addr);
@@ -174,13 +174,16 @@ impl NetTransport
 
 impl Transport for NetTransport
 {
-    fn find_advertise_addr(&self, addr: String) -> Result<SocketAddr, AddrParseError>
+    fn find_advertise_addr(&self) -> io::Result<SocketAddr>
     {
-        if addr.is_empty() {
-            return Ok(self.tcp_listener.local_addr().unwrap().as_socket().unwrap())
-        }
-
-        return SocketAddr::from_str(addr.as_str());
+        return match self.tcp_listener.local_addr() {
+            Ok(addr) => {
+                Ok(addr.as_socket().unwrap())
+            }
+            Err(e) => {
+                e
+            }
+        };
     }
 
     fn write_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<Instant>
