@@ -1,7 +1,6 @@
-use std::sync::mpsc::Sender;
 use std::rc::Rc;
-use std::convert::{TryFrom, Infallible};
 use std::any::Any;
+use tokio::sync::mpsc::UnboundedSender;
 
 pub trait Broadcast: Any
 {
@@ -56,9 +55,9 @@ impl Broadcast for DummyBroadcast {
 }
 
 pub struct OmegaBroadcast {
-    node: String,
-    msg: Vec<u8>,
-    notify: Option<Sender<bool>>
+    pub node: String,
+    pub msg: Vec<u8>,
+    pub notify: Option<UnboundedSender<()>>
 }
 
 impl Broadcast for OmegaBroadcast {
@@ -82,7 +81,7 @@ impl Broadcast for OmegaBroadcast {
     fn finished(&self)
     {
         if self.notify.is_some() {
-            self.notify.unwrap().send(true);
+            self.notify.as_ref().unwrap().send(());
         }
     }
 }

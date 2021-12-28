@@ -1,19 +1,17 @@
 use std::net::SocketAddr;
-use std::io::Error;
 use std::io;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering, AtomicBool};
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
 use std::rc::Rc;
+use std::cell::RefCell;
 
 use rand::Rng;
-use bincode::ErrorKind;
+use tokio::sync::mpsc::UnboundedSender;
+use serde::Serialize;
 
 use crate::config::Config;
-use crate::transport::{NetTransport, Transport};
-use crate::state::Alive;
+use crate::transport::{Transport};
 use crate::awareness::Awareness;
 use crate::queue::TransmitLimitedQueue;
 use crate::broadcast::OmegaBroadcast;
@@ -30,66 +28,68 @@ pub struct Omega {
     config: Config,
     leave: AtomicBool,
 
-    transport: dyn Transport,
+    transport: Transport,
 
     awareness: Awareness,
 
     broadcast: TransmitLimitedQueue,
 
-    nodes: Vec<NodeState>,
-    nodes_map: HashMap<String, NodeState>
+    nodes: Vec<Rc<RefCell<NodeState>>>,
+    nodes_map: HashMap<String, Rc<RefCell<NodeState>>>
 }
 
 impl Omega {
-    pub fn new(config: Config) {
+    // pub fn new(config: Config) -> Omega
+    // {
+    //
+    // }
+    //
+    // fn create_omega(config: Config) -> Omega
+    // {
+    //
+    // }
 
+    fn set_alive(&mut self, notify: Option<UnboundedSender<()>>) -> io::Result<()>
+    {
+        let addr = self.refresh_advertise()?;
+        let alive = Alive {
+            incarnation: self.next_incarnation(),
+            node: self.config.node.clone(),
+            addr
+        };
+        self.alive_node(alive, false, notify);
+        return Ok(());
     }
 
-    fn create_omega(config: Config) -> Omega {
-        
+    fn refresh_advertise(&mut self) -> io::Result<SocketAddr>
+    {
+        self.advertise_addr = self.transport.find_advertise_addr()?;
+        return Ok(self.advertise_addr.clone());
     }
 
-    fn set_alive(&mut self) -> io::Result<()> {
-        let result = self.refresh_advertise();
-        return match result {
-            Ok(addr) => {
-                self.alive_node(Alive {
-                    incarnation: self.next_incarnation(),
-                    node: self.config.node.clone(),
-                    addr
-                });
-                Ok(())
-            }
-            Err(e) => {
-                e
-            }
-        }
-    }
-
-    fn refresh_advertise(&mut self) -> io::Result<SocketAddr> {
-        let result = self.transport.find_advertise_addr();
-        match result {
-            Ok(addr) => {
-                self.advertise_addr = addr;
-                Ok(self.advertise_addr.clone())
-            }
-            Err(e) => {
-                e
-            }
-        }
-    }
-
-    fn is_left(&self) -> bool {
+    fn is_left(&self) -> bool
+    {
         return self.leave.load(Ordering::Acquire);
     }
 }
 
-impl Omega {
-    fn encode_and_broadcast<T: ?Sized>(&mut self, node: String, kind: MessageKind, msg: &T) {
+impl Omega
+{
+    fn encode_and_broadcast<T: ?Sized>(&mut self, node: String, kind: MessageKind, msg: &T)
+    where
+        T: Serialize
+    {
         self.encode_broadcast_and_notify(node, kind, msg, None);
     }
 
-    fn encode_broadcast_and_notify<T: ?Sized>(&mut self, node: String, kind: MessageKind, msg: &T, notify: Option<Sender<bool>>) {
+    fn encode_broadcast_and_notify<T: ?Sized>(&mut self,
+                                              node: String,
+                                              kind: MessageKind,
+                                              msg: &T,
+                                              notify: Option<UnboundedSender<()>>)
+    where
+        T: Serialize
+    {
         let result = encode(kind, msg);
         match result {
             Ok(bytes) => {
@@ -99,7 +99,8 @@ impl Omega {
         }
     }
 
-    fn queue_broadcast(&mut self, node: String, msg: Vec<u8>, notify: Option<Sender<bool>>) {
+    fn queue_broadcast(&mut self, node: String, msg: Vec<u8>, notify: Option<UnboundedSender<()>>)
+    {
         let broadcast = OmegaBroadcast{
             node,
             msg,
@@ -125,30 +126,32 @@ impl Omega {
         return self.incarnation.fetch_add(offset, Ordering::Acquire);
     }
 
-    fn alive_node(&mut self, alive: Alive, bootstrap: bool, notify: Option<Sender<bool>>) {
+    fn alive_node(&mut self, alive: Alive, bootstrap: bool, notify: Option<UnboundedSender<()>>)
+    {
         let mut update_nodes = false;
         let is_local_node = alive.node == self.config.node.clone();
-        let mut state: NodeState;
+        let mut shared_state;
 
         if self.is_left() && is_local_node {
             return;
         }
 
-        if let Some(node_state) = self.nodes_map.get_mut(&alive.node) {
-            if alive.addr != node_state.node.addr {
+        if let Some(node_state) = self.nodes_map.get(&alive.node) {
+            let state = node_state.borrow();
+            if alive.addr != state.node.addr {
                 let can_reclaim = self.config.dead_node_reclaim_time > Duration::ZERO
-                    && self.config.dead_node_reclaim_time <= Instant::now().duration_since(node_state.state_change);
+                    && self.config.dead_node_reclaim_time <= Instant::now().duration_since(state.state_change);
 
-                if node_state.state == Left
-                    || (node_state.state == Dead && can_reclaim) {
+                if state.state == Left
+                    || (state.state == Dead && can_reclaim) {
                     update_nodes = true;
                 } else {
                     return;
                 }
             }
-            &state = node_state;
+            shared_state = node_state.clone();
         } else {
-            state = NodeState {
+            let node_state = NodeState {
                 node: Node {
                     name: alive.node.clone(),
                     addr: alive.addr,
@@ -158,14 +161,16 @@ impl Omega {
                 incarnation: alive.incarnation,
                 state_change: Instant::now()
             };
+            shared_state = Rc::new(RefCell::new(node_state));
 
             let n = self.nodes.len();
             let offset = rand::thread_rng().gen_range(0..n);
 
-            self.nodes_map.insert(alive.node.clone(), state);
-            self.nodes.push(node_state.clone());
+            self.nodes_map.insert(alive.node.clone(), shared_state.clone());
+            self.nodes.push(shared_state.clone());
             self.nodes.swap(offset, n);
         }
+        let mut state = shared_state.borrow_mut();
 
         if alive.incarnation <= state.incarnation && !is_local_node && !update_nodes {
             return;
@@ -178,7 +183,7 @@ impl Omega {
         // Todo - Clear out any suspicion timer
 
         if is_local_node && !bootstrap {
-            self.refute(&mut state, alive.incarnation)
+            self.refute(shared_state.clone(), alive.incarnation)
         } else {
             // broadcast and notify
             self.encode_broadcast_and_notify(state.get_name(), AliveMessage, &alive, notify);
@@ -192,23 +197,25 @@ impl Omega {
         }
     }
 
-    fn refute(&mut self, node_state: &mut NodeState, accused_inc: u32) {
+    fn refute(&mut self, shared_state: Rc<RefCell<NodeState>>, accused_inc: u32)
+    {
         let mut inc = self.next_incarnation();
         if accused_inc >= inc {
             inc = self.skip_incarnation(accused_inc - inc + 1);
         }
 
-        node_state.incarnation = inc;
+        let mut state = shared_state.borrow_mut();
+        state.incarnation = inc;
 
         self.awareness.apply_delta(1);
-        
+
         let alive = Alive {
             incarnation: inc,
-            node: node_state.get_name(),
-            addr: node_state.get_addr()
+            node: state.get_name(),
+            addr: state.get_addr()
         };
 
         // encode and broadcast
-        self.encode_and_broadcast(node_state.get_name(), AliveMessage, &alive);
+        self.encode_and_broadcast(state.get_name(), AliveMessage, &alive);
     }
 }

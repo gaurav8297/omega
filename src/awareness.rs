@@ -1,5 +1,4 @@
 use std::sync::RwLock;
-use std::ops::DerefMut;
 use std::time::Duration;
 
 pub struct Awareness
@@ -24,7 +23,7 @@ impl Awareness
         *score += delta;
         if score.is_negative() {
             *score = 0;
-        } else if score > (self.max - 1) as i32 {
+        } else if *score > (self.max - 1) as i32 {
             *score = (self.max - 1) as i32;
         }
     }

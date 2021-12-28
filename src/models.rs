@@ -1,8 +1,12 @@
 use std::net::SocketAddr;
 use std::time::Instant;
-use bincode::{Decode, Encode, ErrorKind};
+use std::fmt::Debug;
+
+use serde::{Serialize, Deserialize};
+use rmp_serde::encode::Error;
 
 /// Node models
+#[derive(Clone, PartialEq)]
 pub enum NodeStateKind {
     Alive,
     Suspect,
@@ -10,13 +14,14 @@ pub enum NodeStateKind {
     Left
 }
 
+#[derive(Clone, PartialEq)]
 pub struct Node {
     pub name: String,
     pub addr: SocketAddr,
     pub state: NodeStateKind
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct NodeState {
     pub node: Node,
     pub state: NodeStateKind,
@@ -37,32 +42,27 @@ impl NodeState {
 }
 
 /// Messages
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum MessageKind {
     AliveMessage
 }
 
 /// Alive message
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Alive {
     pub incarnation: u32,
     pub node: String,
     pub addr: SocketAddr
 }
 
-pub fn encode<T: ?Sized>(kind: MessageKind, message: &T) -> bincode::Result<Vec<u8>>
-where
-    T: serde::Serialize,
+pub fn encode<T: ?Sized>(kind: MessageKind, message: &T) -> Result<Vec<u8>, Error>
+    where
+    T: Serialize
 {
-    let mut buff = bincode::serialize(&kind).unwrap();
-    return match bincode::serialize(message) {
-        Ok(mut val) => {
-            buff.append(&mut val);
-            Ok(buff)
-        }
-        Err(e) => {
-            e
-        }
-    }
+    let mut buf = rmp_serde::to_vec(&kind)?;
+    let mut val = rmp_serde::to_vec(message)?;
+    buf.append(&mut val);
+    return Ok(buf);
 }
 //
 // pub fn

@@ -80,7 +80,7 @@ fn assert_lb_order(min: LimitedBroadcast, max: LimitedBroadcast)
 #[test]
 fn test_queue_broadcast()
 {
-    let mut queue = TransmitLimitedQueue::new(|| 1, 1);
+    let mut queue = TransmitLimitedQueue::new(1);
 
     let msg1 = String::from("msg1");
     let msg2 = String::from("msg2");
@@ -110,12 +110,12 @@ fn test_queue_broadcast()
 #[test]
 fn test_get_broadcast()
 {
-    let mut queue = TransmitLimitedQueue::new(|| 1, 1);
+    let mut queue = TransmitLimitedQueue::new(1);
     let msg1 = String::from("msg1");
     let msg2 = String::from("msg2");
     let msg3 = String::from("msg3");
 
-    let val = queue.find_broadcasts(3, 100);
+    let val = queue.find_broadcasts(1, 3, 100);
     assert!(val.is_none());
 
     queue.queue_broadcast(Rc::new(DummyBroadcast::new_with_msg(msg1.clone())));
@@ -123,22 +123,22 @@ fn test_get_broadcast()
     queue.queue_broadcast(Rc::new(DummyBroadcast::new_with_msg(msg3.clone())));
 
     // No results if limit is zero
-    let val = queue.find_broadcasts(3, 0);
+    let val = queue.find_broadcasts(1, 3, 0);
     assert!(val.is_some());
     assert_eq!(val.unwrap().len(), 0);
 
-    let val = queue.find_broadcasts(3, 20);
+    let val = queue.find_broadcasts(1, 3, 20);
     assert!(val.is_some());
     assert_eq!(val.unwrap(), vec![msg3.clone().into_bytes(), msg2.clone().into_bytes()]);
 
-    let val = queue.find_broadcasts(3, 20);
+    let val = queue.find_broadcasts(1, 3, 20);
     assert!(val.is_some());
     assert_eq!(val.unwrap(), vec![msg1.clone().into_bytes(), msg3.clone().into_bytes()]);
 
-    let val = queue.find_broadcasts(3, 20);
+    let val = queue.find_broadcasts(1, 3, 20);
     assert!(val.is_some());
     assert_eq!(val.unwrap(), vec![msg2.clone().into_bytes(), msg1.clone().into_bytes()]);
 
-    let val = queue.find_broadcasts(3, 20);
+    let val = queue.find_broadcasts(1, 3, 20);
     assert!(val.is_none());
 }

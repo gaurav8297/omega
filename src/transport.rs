@@ -1,23 +1,21 @@
-use std::net::{SocketAddr, AddrParseError, UdpSocket, Shutdown, TcpListener};
+use std::net::SocketAddr;
 use std::time::{Instant, Duration};
-use std::sync::mpsc::{Receiver, Sender};
-use std::{thread, io};
-use std::sync::mpsc;
-use std::str::FromStr;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
-use std::mem::MaybeUninit;
-use std::io::Error;
+use std::io;
+use std::sync::Arc;
 
-use log::{info, error};
+use log::error;
 use socket2::{Socket, Domain, Type, Protocol, SockAddr};
+use tokio::net::{TcpListener, UdpSocket, TcpStream};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver};
+use tokio::time::timeout;
+use tokio::task::JoinHandle;
 
-const UDP_PACKET_BUFFER_SIZE: usize = 10;
+const UDP_PACKET_BUFFER_SIZE: usize = 65536;
 const UDP_RECEIVE_BUF_SIZE: usize = 2 * 1024 * 1024;
-const UDP_READ_TIME_OUT: Duration = Duration::from_millis(100);
-
-static IS_TRANSPORT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+const UDP_READ_TIME_OUT: Duration = Duration::from_millis(30);
+const TCP_LISTEN_TIME_OUT: Duration = Duration::from_millis(30);
 
 pub struct Packet
 {
@@ -32,88 +30,60 @@ pub struct Address
     name: String
 }
 
-pub trait Transport
+pub struct Transport
 {
-    fn find_advertise_addr(&self) -> io::Result<SocketAddr>;
-    fn write_to_address(&self, data: &[u8], addr: Address) -> io::Result<Instant>
-    {
-        return self.write_to(data, addr.addr);
-    }
-    fn write_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<Instant>;
-    fn packet_channel(&self) -> Rc<Receiver<Packet>>;
-    fn connect_timeout_address(&self, addr: Address, timeout: Duration) -> io::Result<Socket>
-    {
-        return self.connect_timeout(addr.addr, timeout);
-    }
-    fn connect_timeout(&self, addr: SocketAddr, timeout: Duration) -> io::Result<Socket>;
-    fn stream_channel(&self) -> Rc<Receiver<Socket>>;
-    fn shutdown(self);
+    packets: UnboundedReceiver<Packet>,
+    streams: UnboundedReceiver<TcpStream>,
+    tcp_listener: Arc<TcpListener>,
+    udp_socket: Arc<UdpSocket>,
+    tcp_handle: JoinHandle<()>,
+    udp_handle: JoinHandle<()>,
+    is_shutdown: Arc<AtomicBool>
 }
 
-pub struct NetTransport
+impl Transport
 {
-    packets: Rc<Receiver<Packet>>,
-    streams: Rc<Receiver<Socket>>,
-    tcp_listener: Socket,
-    udp_socket: Socket,
-    tcp_handle: Option<JoinHandle<()>>,
-    udp_handle: Option<JoinHandle<()>>
-}
-
-impl NetTransport
-{
-    pub fn new(bind_addr: SocketAddr) -> io::Result<NetTransport>
+    pub async fn new(bind_addr: SocketAddr) -> io::Result<Transport>
     {
-        let sock_addr = SockAddr::from(bind_addr);
+        let tcp_listener = Arc::new(TcpListener::bind(bind_addr.clone()).await?);
 
-        let tcp_socket = Socket::new(Domain::IPV4, Type::STREAM, Option::Some(Protocol::TCP))?;
-        let bind_result = tcp_socket.bind(&sock_addr);
-        tcp_socket.listen(128)?;
-        tcp_socket.set_nonblocking(true);
-        match bind_result {
-            Ok(_) => {}
-            Err(e) => {
-                return Err(e)
-            }
-        }
+        let std_socket = Socket::new(Domain::IPV4, Type::DGRAM, Option::Some(Protocol::UDP))?;
+        std_socket.set_recv_buffer_size(UDP_RECEIVE_BUF_SIZE)?;
+        std_socket.set_read_timeout(Option::Some(UDP_READ_TIME_OUT))?;
+        std_socket.bind(&SockAddr::from(bind_addr.clone()))?;
+        let udp_socket = Arc::new(UdpSocket::from_std(std_socket.into())?);
 
-        let udp_socket = Socket::new(Domain::IPV4, Type::DGRAM, Option::Some(Protocol::UDP))?;
-        udp_socket.set_recv_buffer_size(UDP_RECEIVE_BUF_SIZE);
-        udp_socket.set_read_timeout(Option::Some(UDP_READ_TIME_OUT));
+        let (stream_sender, stream_rec) = mpsc::unbounded_channel();
+        let (packet_sender, packet_rec) = mpsc::unbounded_channel();
 
-        let bind_result = udp_socket.bind(&sock_addr);
-        match bind_result {
-            Ok(_) => {}
-            Err(e) => {
-                return Err(e)
-            }
-        }
+        let is_shutdown = Arc::new(AtomicBool::new(false));
 
-        let (packet_sender, packet_rec): (Sender<Packet>, Receiver<Packet>) = mpsc::channel();
-        let (stream_sender, stream_rec): (Sender<Socket>, Receiver<Socket>) = mpsc::channel();
+        let tcp_handle = tokio::spawn(Self::start_tcp_listener(
+            tcp_listener.clone(),
+            stream_sender,
+            is_shutdown.clone()));
+        let udp_handle = tokio::spawn(Self::start_udp_listener(
+            udp_socket.clone(),
+            packet_sender,
+            is_shutdown.clone()));
 
-        let mut transport = NetTransport {
-            packets: Rc::new(packet_rec),
-            streams: Rc::new(stream_rec),
-            tcp_listener: tcp_socket,
-            udp_socket,
-            tcp_handle: None,
-            udp_handle: None
+        let transport = Transport {
+            packets: packet_rec,
+            streams: stream_rec,
+            tcp_listener: tcp_listener.clone(),
+            udp_socket: udp_socket.clone(),
+            tcp_handle,
+            udp_handle,
+            is_shutdown: is_shutdown.clone()
         };
-
-        transport.start_udp_listener_thread(packet_sender);
-        transport.start_tcp_listener_thread(stream_sender);
-
         return Ok(transport);
     }
 
-    fn start_udp_listener_thread(&mut self, sender: Sender<Packet>)
+    async fn start_udp_listener(udp_socket: Arc<UdpSocket>, sender: UnboundedSender<Packet>, is_shutdown: Arc<AtomicBool>)
     {
-        let socket = self.udp_socket.try_clone().unwrap();
-        let udp_handle = thread::spawn(move || {
-            loop {
-                let mut buf = [MaybeUninit::<u8>::uninit(); UDP_PACKET_BUFFER_SIZE];
-                let result = socket.recv_from(&mut buf);
+        loop {
+            let mut buf = [0; UDP_PACKET_BUFFER_SIZE];
+            if let Ok(result) = timeout(UDP_READ_TIME_OUT, udp_socket.recv_from(&mut buf)).await {
                 match result
                 {
                     Ok((size, addr)) => {
@@ -122,14 +92,9 @@ impl NetTransport
                             continue;
                         }
 
-                        let mut data = vec![];
-                        for i in 0..size {
-                            unsafe { data.push(buf[i].assume_init()) }
-                        }
-
                         sender.send(Packet {
-                            buf: data,
-                            from: addr.as_socket().unwrap(),
+                            buf: buf[0 .. size].to_vec(),
+                            from: addr,
                             timestamp: Instant::now()
                         });
                     }
@@ -137,21 +102,19 @@ impl NetTransport
                         error!("{}", e.to_string());
                     }
                 }
-                if IS_TRANSPORT_SHUTDOWN.load(Ordering::Acquire) {
-                    break;
-                }
             }
-        });
-        self.udp_handle = Option::Some(udp_handle);
+
+            if is_shutdown.load(Ordering::Acquire) {
+                break;
+            }
+        }
     }
 
-    fn start_tcp_listener_thread(&mut self, sender: Sender<Socket>)
+    async fn start_tcp_listener(tcp_listener: Arc<TcpListener>, sender: UnboundedSender<TcpStream>, is_shutdown: Arc<AtomicBool>)
     {
-        let listener = self.tcp_listener.try_clone().unwrap();
-        let tcp_handle = thread::spawn(move || {
-            loop {
-                let result_stream = listener.accept();
-                match result_stream {
+        loop {
+            if let Ok(result) = timeout(TCP_LISTEN_TIME_OUT, tcp_listener.accept()).await {
+                match result {
                     Ok((stream, _)) => {
                         sender.send(stream);
                     }
@@ -159,37 +122,25 @@ impl NetTransport
                         error!("{}", e.to_string());
                     }
                 }
-
-                if IS_TRANSPORT_SHUTDOWN.load(Ordering::Acquire) {
-                    break;
-                }
-
-                info!("[Tcp Listen Thread] Sleeping for 30 ms..");
-                thread::sleep(Duration::from_millis(30))
             }
-        });
-        self.tcp_handle = Option::Some(tcp_handle);
+
+            if is_shutdown.load(Ordering::Acquire) {
+                break;
+            }
+        }
     }
 }
 
-impl Transport for NetTransport
+impl Transport
 {
-    fn find_advertise_addr(&self) -> io::Result<SocketAddr>
+    pub fn find_advertise_addr(&self) -> io::Result<SocketAddr>
     {
-        return match self.tcp_listener.local_addr() {
-            Ok(addr) => {
-                Ok(addr.as_socket().unwrap())
-            }
-            Err(e) => {
-                e
-            }
-        };
+        return self.tcp_listener.local_addr();
     }
 
-    fn write_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<Instant>
+    pub async fn write_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<Instant>
     {
-        let result = self.udp_socket.send_to(data, &SockAddr::from(addr));
-        return match result {
+        return match self.udp_socket.send_to(data, addr).await {
             Ok(_) => {
                 Ok(Instant::now())
             }
@@ -199,38 +150,33 @@ impl Transport for NetTransport
         }
     }
 
-    fn packet_channel(&self) -> Rc<Receiver<Packet>> {
-        return self.packets.clone();
+    pub fn packet_channel(&mut self) -> &mut UnboundedReceiver<Packet> {
+        return &mut self.packets;
     }
 
-    fn connect_timeout(&self, addr: SocketAddr, timeout: Duration) -> io::Result<Socket> {
-        let tcp_socket = Socket::new(Domain::IPV4, Type::STREAM, Option::Some(Protocol::TCP))?;
-
-        let result = tcp_socket.connect_timeout(&SockAddr::from(addr), timeout);
-        return match result {
-            Ok(_) => {
-                Ok(tcp_socket)
+    pub async fn connect_timeout(&self, addr: SocketAddr, duration: Duration) -> io::Result<TcpStream> {
+        return match timeout(duration, TcpStream::connect(addr)).await {
+            Ok(res) => {
+                res
             }
             Err(e) => {
-                Err(e)
+                Err(e.into())
             }
         }
     }
 
-    fn stream_channel(&self) -> Rc<Receiver<Socket>> {
-        return self.streams.clone();
+    pub fn stream_channel(&mut self) -> &mut UnboundedReceiver<TcpStream> {
+        return &mut self.streams;
     }
 
-    fn shutdown(self) {
-        IS_TRANSPORT_SHUTDOWN.store(true, Ordering::Release);
-        self.tcp_listener.shutdown(Shutdown::Both);
+    pub async fn shutdown(self) {
+        self.is_shutdown.store(true, Ordering::Release);
 
-        if self.tcp_handle.is_some() {
-            self.tcp_handle.unwrap().join();
+        if let Err(e) = self.tcp_handle.await {
+            error!("Error while stopping tcp listener: {}", e.to_string())
         }
-
-        if self.udp_handle.is_some() {
-            self.udp_handle.unwrap().join();
+        if let Err(e) = self.udp_handle.await {
+            error!("Error while stopping udp socket: {}", e.to_string())
         }
     }
 }

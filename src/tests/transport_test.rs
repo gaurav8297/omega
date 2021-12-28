@@ -1,57 +1,59 @@
 use std::time::Duration;
-use std::net::{TcpStream, SocketAddr};
-use std::io::{Write, Read};
+use std::net::SocketAddr;
 use std::str::FromStr;
 
-use crate::transport::{NetTransport, Transport};
+use tokio::net::TcpStream;
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 
-#[test]
-fn test_transport_write_to()
+use crate::transport::Transport;
+
+#[tokio::test]
+async fn test_transport_write_to()
 {
     let addr = get_random_local_addr();
-    let transport = NetTransport::new(addr).unwrap();
+    let mut transport = Transport::new(addr).await.unwrap();
 
-    let data = "tests data".as_bytes();
-    transport.write_to(data, addr);
+    let data = b"tests data";
+    transport.write_to(data, addr).await;
 
-    let result = transport.packet_channel().recv().unwrap();
+    let result = transport.packet_channel().recv().await.unwrap();
     assert_eq!(result.buf.as_slice(), data);
 
-    transport.shutdown();
+    transport.shutdown().await;
 }
 
-#[test]
-fn test_transport_connect_timeout()
+#[tokio::test]
+async fn test_transport_connect_timeout()
 {
     let addr1 = get_random_local_addr();
     let addr2 = get_random_local_addr();
 
-    let transport = NetTransport::new(addr1).unwrap();
-    let result = transport.connect_timeout(addr1, Duration::from_millis(100));
+    let transport = Transport::new(addr1).await.unwrap();
+    let result = transport.connect_timeout(addr1, Duration::from_millis(100)).await;
     assert!(result.is_ok());
 
-    let result = transport.connect_timeout(addr2, Duration::from_millis(100));
+    let result = transport.connect_timeout(addr2, Duration::from_millis(100)).await;
     assert!(result.is_err());
 
-    transport.shutdown();
+    transport.shutdown().await;
 }
 
-#[test]
-fn test_transport_stream_channel()
+#[tokio::test]
+async fn test_transport_stream_channel()
 {
     let addr = get_random_local_addr();
-    let transport = NetTransport::new(addr).unwrap();
+    let mut transport = Transport::new(addr).await.unwrap();
 
-    let data = "tests data".as_bytes();
-    let mut stream = TcpStream::connect(addr).unwrap();
-    stream.write(data);
+    let data = b"tests data";
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(data).await;
 
-    let mut expected_data = [0; 9];
-    let mut socket = transport.stream_channel().recv().unwrap();
-    socket.read(&mut expected_data);
-    assert_eq!(expected_data, data);
+    let mut expected_data = [0; 10];
+    let mut socket = transport.stream_channel().recv().await.unwrap();
+    socket.read(&mut expected_data).await;
+    assert_eq!(expected_data, *data);
 
-    transport.shutdown();
+    transport.shutdown().await;
 }
 
 fn get_random_local_addr() -> SocketAddr

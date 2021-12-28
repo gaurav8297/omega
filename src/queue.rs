@@ -1,21 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::cmp::Ordering;
-use std::fs::read;
-use std::ops::{DerefMut, Deref};
 use std::rc::Rc;
 use std::ops::Bound::{Included, Excluded};
 use std::cell::RefCell;
 use std::fmt::{Debug, Formatter};
-use std::collections::btree_set::Iter;
-use std::iter::Cloned;
 
 use crate::util::retransmit_limit;
 use crate::broadcast::{Broadcast, DummyBroadcast};
 
 pub struct TransmitLimitedQueue
 {
-    num_nodes: fn() -> usize,
     retransmit_mul: usize,
     transmit_map: Mutex<BTreeSet<Rc<RefCell<LimitedBroadcast>>>>,
     id_gen: u64
@@ -90,10 +85,9 @@ impl Ord for LimitedBroadcast
 
 impl TransmitLimitedQueue
 {
-    pub fn new(num_nodes: fn() -> usize, retransmit_mul: usize) -> TransmitLimitedQueue
+    pub fn new(retransmit_mul: usize) -> TransmitLimitedQueue
     {
         return TransmitLimitedQueue {
-            num_nodes,
             retransmit_mul,
             transmit_map: Mutex::new(BTreeSet::new()),
             id_gen: 0
@@ -141,14 +135,14 @@ impl TransmitLimitedQueue
         self.cleanup_id_gen();
     }
 
-    pub fn find_broadcasts(&mut self, overhead: usize, limit: usize) -> Option<Vec<Vec<u8>>>
+    pub fn find_broadcasts(&mut self, num_nodes: usize, overhead: usize, limit: usize) -> Option<Vec<Vec<u8>>>
     {
         let queue = self.transmit_map.get_mut().unwrap();
         if queue.is_empty() {
             return Option::None;
         }
 
-        let transmit_limit = retransmit_limit(self.retransmit_mul, (self.num_nodes)());
+        let transmit_limit = retransmit_limit(self.retransmit_mul, num_nodes);
 
         let min_transmit = get_min(&queue).borrow().transmit;
         let max_transmit = get_max(&queue).borrow().transmit;
