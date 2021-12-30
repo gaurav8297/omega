@@ -21,13 +21,13 @@ pub struct Packet
 {
     pub buf: Vec<u8>,
     pub from: SocketAddr,
-    pub timestamp: Instant
+    pub timestamp: Instant,
 }
 
 pub struct Address
 {
     addr: SocketAddr,
-    name: String
+    name: String,
 }
 
 pub struct Transport
@@ -38,7 +38,7 @@ pub struct Transport
     udp_socket: Arc<UdpSocket>,
     tcp_handle: JoinHandle<()>,
     udp_handle: JoinHandle<()>,
-    is_shutdown: Arc<AtomicBool>
+    is_shutdown: Arc<AtomicBool>,
 }
 
 impl Transport
@@ -74,7 +74,7 @@ impl Transport
             udp_socket: udp_socket.clone(),
             tcp_handle,
             udp_handle,
-            is_shutdown: is_shutdown.clone()
+            is_shutdown: is_shutdown.clone(),
         };
         return Ok(transport);
     }
@@ -93,9 +93,9 @@ impl Transport
                         }
 
                         sender.send(Packet {
-                            buf: buf[0 .. size].to_vec(),
+                            buf: buf[0..size].to_vec(),
                             from: addr,
-                            timestamp: Instant::now()
+                            timestamp: Instant::now(),
                         });
                     }
                     Err(e) => {
@@ -147,7 +147,7 @@ impl Transport
             Err(e) => {
                 Err(e)
             }
-        }
+        };
     }
 
     pub fn packet_channel(&mut self) -> &mut UnboundedReceiver<Packet> {
@@ -162,7 +162,7 @@ impl Transport
             Err(e) => {
                 Err(e.into())
             }
-        }
+        };
     }
 
     pub fn stream_channel(&mut self) -> &mut UnboundedReceiver<TcpStream> {

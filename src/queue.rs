@@ -1,31 +1,59 @@
-use std::collections::BTreeSet;
-use std::sync::Mutex;
 use std::cmp::Ordering;
-use std::rc::Rc;
-use std::ops::Bound::{Included, Excluded};
-use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
+use std::ops::Bound::{Excluded, Included};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, AtomicU64};
+use std::sync::atomic::Ordering::Relaxed;
 
-use crate::util::retransmit_limit;
 use crate::broadcast::{Broadcast, DummyBroadcast};
+use crate::util::retransmit_limit;
 
 pub struct TransmitLimitedQueue
 {
     retransmit_mul: usize,
-    transmit_map: Mutex<BTreeSet<Rc<RefCell<LimitedBroadcast>>>>,
-    id_gen: u64
+    transmit_map: Mutex<BTreeSet<Arc<LimitedBroadcast>>>,
+    id_gen: AtomicU64,
 }
 
 pub struct LimitedBroadcast
 {
-    pub transmit: usize,
-    pub msg_len: usize,
-    pub id: u64,
-    pub broadcast: Rc<dyn Broadcast>,
-    pub name: Option<String>
+    id: u64,
+    transmit: AtomicUsize,
+    broadcast: Arc<dyn Broadcast + Sync + Send>,
+    msg_len: usize,
 }
 
-impl Debug for LimitedBroadcast {
+impl LimitedBroadcast
+{
+    pub fn new(id: u64,
+               transmit: usize,
+               msg_len: usize,
+               broadcast: Arc<dyn Broadcast + Sync + Send>) -> LimitedBroadcast {
+        return LimitedBroadcast {
+            id,
+            transmit: AtomicUsize::from(transmit),
+            broadcast,
+            msg_len,
+        };
+    }
+
+    pub fn get_transmit(&self) -> usize {
+        return self.transmit.load(Relaxed);
+    }
+
+    pub fn increment_transmit(&self) {
+        self.transmit.fetch_add(1, Relaxed);
+    }
+
+    pub fn get_message(&self) -> Arc<Vec<u8>>
+    {
+        return self.broadcast.message();
+    }
+}
+
+impl Debug for LimitedBroadcast
+{
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result
     {
         f.debug_tuple("")
@@ -36,36 +64,40 @@ impl Debug for LimitedBroadcast {
     }
 }
 
-impl PartialEq for LimitedBroadcast {
-    fn eq(&self, other: &Self) -> bool {
-        if self.transmit == other.transmit
+impl PartialEq for LimitedBroadcast
+{
+    fn eq(&self, other: &Self) -> bool
+    {
+        if self.get_transmit() == other.get_transmit()
             && self.msg_len == other.msg_len
-            && self.id == other.id
-            && self.name == other.name {
+            && self.id == other.id {
             return true;
         }
         return false;
     }
 }
 
-impl PartialOrd for LimitedBroadcast {
+impl PartialOrd for LimitedBroadcast
+{
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Eq for LimitedBroadcast {}
+impl Eq for LimitedBroadcast
+{}
 
 impl Ord for LimitedBroadcast
 {
-    fn cmp(&self, other: &Self) -> Ordering {
+    fn cmp(&self, other: &Self) -> Ordering
+    {
         if self.eq(other) {
             return Ordering::Equal;
         }
 
-        if self.transmit < other.transmit {
+        if self.get_transmit() < other.get_transmit() {
             return Ordering::Less;
-        } else if self.transmit > other.transmit {
+        } else if self.get_transmit() > other.get_transmit() {
             return Ordering::Greater;
         }
 
@@ -79,7 +111,7 @@ impl Ord for LimitedBroadcast
             Ordering::Less
         } else {
             Ordering::Greater
-        }
+        };
     }
 }
 
@@ -90,31 +122,43 @@ impl TransmitLimitedQueue
         return TransmitLimitedQueue {
             retransmit_mul,
             transmit_map: Mutex::new(BTreeSet::new()),
-            id_gen: 0
-        }
+            id_gen: AtomicU64::new(0),
+        };
     }
 
-    pub fn queue_broadcast(&mut self, broadcast: Rc<impl Broadcast>) {
+    fn get_id_gen(&self) -> u64 {
+        return self.id_gen.load(Relaxed);
+    }
+
+    fn reset_id_gen(&self) {
+        self.id_gen.store(0, Relaxed);
+    }
+
+    fn increment_id_gen(&self) -> u64 {
+        return self.id_gen.fetch_add(1, Relaxed);
+    }
+
+    pub fn queue_broadcast(&self, broadcast: Arc<impl Broadcast + Sync + Send>)
+    {
         self._queue_broadcast(broadcast, 0);
     }
 
-    pub fn _queue_broadcast(&mut self, broadcast: Rc<impl Broadcast>, initial_transmits: usize)
+    pub fn _queue_broadcast(&self, broadcast: Arc<impl Broadcast + Sync + Send>, initial_transmits: usize)
     {
-        let queue = self.transmit_map.get_mut().unwrap();
+        let mut queue = self.transmit_map.lock().unwrap();
         let mut remove = vec![];
 
-        if self.id_gen == u64::MAX {
-            self.id_gen = 0;
+        if self.get_id_gen() == u64::MAX {
+            self.reset_id_gen();
         } else {
-            self.id_gen += 1;
+            self.increment_id_gen();
         }
 
         queue.iter()
-            .for_each(|shared_lb| {
-                let lb = shared_lb.borrow();
-                if lb.broadcast.invalidates(Box::new(broadcast.clone())) {
+            .for_each(|lb| {
+                if lb.broadcast.invalidates(broadcast.clone()) {
                     lb.broadcast.finished();
-                    remove.push(shared_lb.clone());
+                    remove.push(lb.clone());
                 }
             });
 
@@ -123,33 +167,31 @@ impl TransmitLimitedQueue
                 queue.remove(lb);
             });
 
-        let limited_broadcast = LimitedBroadcast {
-            transmit: initial_transmits,
-            msg_len: broadcast.message().len(),
-            id: self.id_gen,
-            broadcast: broadcast.clone(),
-            name: Option::None
-        };
+        let limited_broadcast = LimitedBroadcast::new(
+            self.get_id_gen(),
+            initial_transmits,
+            broadcast.message().len(),
+            broadcast.clone());
 
-        queue.insert(Rc::new(RefCell::new(limited_broadcast)));
-        self.cleanup_id_gen();
+        queue.insert(Arc::new(limited_broadcast));
+        self.cleanup_id_gen(&queue);
     }
 
-    pub fn find_broadcasts(&mut self, num_nodes: usize, overhead: usize, limit: usize) -> Option<Vec<Vec<u8>>>
+    pub fn find_broadcasts(&self, num_nodes: usize, overhead: usize, limit: usize) -> Option<Vec<Arc<Vec<u8>>>>
     {
-        let queue = self.transmit_map.get_mut().unwrap();
+        let mut queue = self.transmit_map.lock().unwrap();
         if queue.is_empty() {
-            return Option::None;
+            return None;
         }
 
         let transmit_limit = retransmit_limit(self.retransmit_mul, num_nodes);
 
-        let min_transmit = get_min(&queue).borrow().transmit;
-        let max_transmit = get_max(&queue).borrow().transmit;
+        let min_transmit = get_min(&queue).get_transmit();
+        let max_transmit = get_max(&queue).get_transmit();
 
-        let mut byte_used: usize = 0;
-        let mut re_insert: Vec<Rc<RefCell<LimitedBroadcast>>> = vec![];
-        let mut ret: Vec<Vec<u8>> = vec![];
+        let mut byte_used = 0;
+        let mut re_insert = vec![];
+        let mut ret = vec![];
         let mut transmit = min_transmit;
 
         while transmit <= max_transmit {
@@ -158,53 +200,48 @@ impl TransmitLimitedQueue
                 break;
             }
 
-            let greater_or_equal = LimitedBroadcast {
-                transmit,
-                msg_len: free as usize,
-                id: u64::MAX,
-                broadcast: Rc::new(DummyBroadcast::new()),
-                name: None
-            };
+            let greater_or_equal = LimitedBroadcast::new(
+                u64::MAX, transmit,
+                free as usize,
+                Arc::new(DummyBroadcast::new()));
 
-            let less_than = LimitedBroadcast {
-                transmit: transmit + 1,
-                msg_len: usize::MAX,
-                id: u64::MAX,
-                broadcast: Rc::new(DummyBroadcast::new()),
-                name: None
-            };
+            let less_than = LimitedBroadcast::new(
+                u64::MAX,
+                transmit + 1,
+                usize::MAX,
+                Arc::new(DummyBroadcast::new()));
+
 
             let item = queue.range((
-                    Included(Rc::new(RefCell::new(greater_or_equal))),
-                    Excluded(Rc::new(RefCell::new(less_than)))))
-                .find(|lb| lb.borrow().msg_len <= free as usize);
+                Included(Arc::new(greater_or_equal)),
+                Excluded(Arc::new(less_than))))
+                .find(|lb| lb.msg_len <= free as usize);
 
             if item.is_none() {
                 transmit += 1;
                 continue;
             }
 
-            let shared_lb = item.unwrap().clone();
-            queue.remove(&shared_lb);
+            let lb = item.unwrap().clone();
+            queue.remove(&lb);
 
-            let mut lb = shared_lb.borrow_mut();
             byte_used += overhead + lb.msg_len;
             ret.push(lb.broadcast.message());
 
-            if lb.transmit + 1 >= transmit_limit {
+            if lb.get_transmit() + 1 >= transmit_limit {
                 lb.broadcast.finished();
             } else {
-                lb.transmit += 1;
-                re_insert.push(shared_lb.clone());
+                lb.increment_transmit();
+                re_insert.push(lb.clone());
             }
         }
 
         re_insert.iter()
-            .for_each(|shared_lb| {
-                queue.insert(shared_lb.clone());
+            .for_each(|lb| {
+                queue.insert(lb.clone());
             });
 
-        self.cleanup_id_gen();
+        self.cleanup_id_gen(&queue);
         return Some(ret);
     }
 
@@ -212,52 +249,53 @@ impl TransmitLimitedQueue
     {
         let queue = self.transmit_map.lock().unwrap();
         queue.iter()
-            .for_each(|shared_lb| {
-                let lb = shared_lb.borrow();
+            .for_each(|lb| {
                 lb.broadcast.finished();
             });
 
         drop(queue);
         self.transmit_map = Mutex::new(BTreeSet::new());
-        self.id_gen = 0;
+        self.reset_id_gen();
     }
 
-    pub fn prune(&mut self, max_retain: usize)
+    pub fn prune(&self, max_retain: usize)
     {
-        let queue = self.transmit_map.get_mut().unwrap();
+        let mut queue = self.transmit_map.lock().unwrap();
 
         while queue.len() > max_retain {
-            let lb = get_max(queue);
-            lb.borrow().broadcast.finished();
+            let lb = get_max(&queue);
+            lb.broadcast.finished();
             queue.remove(&lb);
         }
 
-        self.cleanup_id_gen();
+        self.cleanup_id_gen(&queue);
     }
 
-    fn cleanup_id_gen(&mut self) {
-        let queue = self.transmit_map.lock().unwrap();
+    fn cleanup_id_gen(&self, queue: &BTreeSet<Arc<LimitedBroadcast>>)
+    {
         if queue.len() == 0 {
-            self.id_gen = 0;
+            self.reset_id_gen();
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(&self) -> usize
+    {
         return self.transmit_map.lock().unwrap().len();
     }
 
-    pub fn collect(&self) -> Vec<Rc<RefCell<LimitedBroadcast>>> {
+    pub fn collect(&self) -> Vec<Arc<LimitedBroadcast>>
+    {
         let queue = self.transmit_map.lock().unwrap();
         return queue.iter().cloned().collect();
     }
 }
 
-pub fn get_max(queue: &BTreeSet<Rc<RefCell<LimitedBroadcast>>>) -> Rc<RefCell<LimitedBroadcast>>
+pub fn get_max(queue: &BTreeSet<Arc<LimitedBroadcast>>) -> Arc<LimitedBroadcast>
 {
     return queue.iter().max().unwrap().clone();
 }
 
-pub fn get_min(queue: &BTreeSet<Rc<RefCell<LimitedBroadcast>>>) -> Rc<RefCell<LimitedBroadcast>>
+pub fn get_min(queue: &BTreeSet<Arc<LimitedBroadcast>>) -> Arc<LimitedBroadcast>
 {
     return queue.iter().min().unwrap().clone();
 }

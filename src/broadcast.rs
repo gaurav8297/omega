@@ -1,11 +1,13 @@
-use std::rc::Rc;
 use std::any::Any;
+use std::sync::Arc;
+
 use tokio::sync::mpsc::UnboundedSender;
 
 pub trait Broadcast: Any
 {
-    fn invalidates(&self, b: Box<dyn Any>) -> bool;
-    fn message(&self) -> Vec<u8>;
+    fn get_name(&self) -> String;
+    fn invalidates(&self, b: Arc<dyn Any + Send + Sync>) -> bool;
+    fn message(&self) -> Arc<Vec<u8>>;
     fn finished(&self);
 }
 
@@ -27,8 +29,12 @@ impl DummyBroadcast {
 }
 
 impl Broadcast for DummyBroadcast {
-    fn invalidates(&self, b: Box<dyn Any>) -> bool {
-        return match b.downcast::<Rc<DummyBroadcast>>() {
+    fn get_name(&self) -> String {
+        return String::new();
+    }
+
+    fn invalidates(&self, b: Arc<dyn Any + Send + Sync>) -> bool {
+        return match b.downcast::<DummyBroadcast>() {
             Ok(other) => {
                 other.message() == self.message()
             }
@@ -38,13 +44,13 @@ impl Broadcast for DummyBroadcast {
         }
     }
 
-    fn message(&self) -> Vec<u8> {
+    fn message(&self) -> Arc<Vec<u8>> {
         return match self.msg.clone() {
             None => {
-                vec![]
+                Arc::new(vec![])
             }
             Some(m) => {
-                m.into_bytes()
+                Arc::new(m.into_bytes())
             }
         };
     }
@@ -55,15 +61,31 @@ impl Broadcast for DummyBroadcast {
 }
 
 pub struct OmegaBroadcast {
-    pub node: String,
-    pub msg: Vec<u8>,
-    pub notify: Option<UnboundedSender<()>>
+    node: String,
+    msg: Arc<Vec<u8>>,
+    notify: Option<UnboundedSender<()>>
+}
+
+impl OmegaBroadcast {
+    pub fn new(node: String,
+               msg: Vec<u8>,
+               notify: Option<UnboundedSender<()>>) -> OmegaBroadcast {
+        return OmegaBroadcast {
+            node,
+            msg: Arc::new(msg),
+            notify
+        }
+    }
 }
 
 impl Broadcast for OmegaBroadcast {
-    fn invalidates(&self, b: Box<dyn Any>) -> bool
+    fn get_name(&self) -> String {
+        return self.node.clone();
+    }
+
+    fn invalidates(&self, b: Arc<dyn Any + Send + Sync>) -> bool
     {
-        return match b.downcast::<Rc<OmegaBroadcast>>() {
+        return match b.downcast::<OmegaBroadcast>() {
             Ok(other) => {
                 other.node == self.node
             }
@@ -73,7 +95,7 @@ impl Broadcast for OmegaBroadcast {
         }
     }
 
-    fn message(&self) -> Vec<u8>
+    fn message(&self) -> Arc<Vec<u8>>
     {
         return self.msg.clone();
     }

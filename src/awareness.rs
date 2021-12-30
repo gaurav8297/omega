@@ -4,7 +4,7 @@ use std::time::Duration;
 pub struct Awareness
 {
     max: u32,
-    score: RwLock<i32>
+    score: RwLock<i32>,
 }
 
 impl Awareness
@@ -14,10 +14,10 @@ impl Awareness
         return Awareness {
             max,
             score: RwLock::new(0),
-        }
+        };
     }
 
-    pub fn apply_delta(&mut self, delta: i32)
+    pub fn apply_delta(&self, delta: i32)
     {
         let mut score = self.score.write().unwrap();
         *score += delta;
@@ -36,6 +36,6 @@ impl Awareness
     pub fn scale_timeout(&self, timeout: Duration) -> Duration
     {
         let score = self.score.read().unwrap();
-        return timeout * (Duration::from_nanos(*score as u64).subsec_nanos() + 1)
+        return timeout * (Duration::from_nanos(*score as u64).subsec_nanos() + 1);
     }
 }

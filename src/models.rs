@@ -11,14 +11,14 @@ pub enum NodeStateKind {
     Alive,
     Suspect,
     Dead,
-    Left
+    Left,
 }
 
 #[derive(Clone, PartialEq)]
 pub struct Node {
     pub name: String,
     pub addr: SocketAddr,
-    pub state: NodeStateKind
+    pub state: NodeStateKind,
 }
 
 #[derive(Clone, PartialEq)]
@@ -26,7 +26,7 @@ pub struct NodeState {
     pub node: Node,
     pub state: NodeStateKind,
     pub incarnation: u32,
-    pub state_change: Instant
+    pub state_change: Instant,
 }
 
 impl NodeState {
@@ -52,12 +52,12 @@ pub enum MessageKind {
 pub struct Alive {
     pub incarnation: u32,
     pub node: String,
-    pub addr: SocketAddr
+    pub addr: SocketAddr,
 }
 
 pub fn encode<T: ?Sized>(kind: MessageKind, message: &T) -> Result<Vec<u8>, Error>
     where
-    T: Serialize
+        T: Serialize
 {
     let mut buf = rmp_serde::to_vec(&kind)?;
     let mut val = rmp_serde::to_vec(message)?;
