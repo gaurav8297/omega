@@ -6,6 +6,7 @@ mod broadcast;
 mod config;
 mod awareness;
 mod models;
+mod suspicion;
 
 #[cfg(test)]
 mod tests;

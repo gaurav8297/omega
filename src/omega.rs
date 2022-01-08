@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
+use std::io::Error;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
@@ -10,21 +11,26 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 use serde::Serialize;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::broadcast::Sender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::awareness::Awareness;
 use crate::broadcast::OmegaBroadcast;
 use crate::config::Config;
-use crate::models::{Alive, encode, MessageKind, Node, NodeState, NodeStateKind};
-use crate::models::MessageKind::AliveMessage;
+use crate::models::{Alive, DeadMessage, decode_from_tcp_stream, encode, encode_to_tcp_stream, MessageKind, Node, NodeState, NodeStateKind, PushPullMessage, read_message_header};
+use crate::models::MessageKind::{AliveMessage, PingMessage, PushPullMessage, Unknown};
 use crate::models::NodeStateKind::{Dead, Left};
 use crate::queue::TransmitLimitedQueue;
+use crate::suspicion::Suspicion;
 use crate::transport::Transport;
 
 struct Nodes
 {
     nodes: Vec<NodeState>,
-    nodes_map: HashMap<String, NodeState>,
+    node_map: HashMap<String, NodeState>,
+    node_suspicion: HashMap<String, Suspicion>,
 }
 
 impl Nodes {
@@ -37,7 +43,7 @@ impl Nodes {
         }
 
         let n = self.nodes.len();
-        self.nodes_map.insert(node.get_name(), node.clone());
+        self.node_map.insert(node.get_name(), node.clone());
         self.nodes.push(node.clone());
 
         if n > 0 {
@@ -54,20 +60,27 @@ impl Nodes {
 
     fn get_node(&self, node_name: &String) -> Option<&NodeState>
     {
-        return self.nodes_map.get(node_name);
+        return self.node_map.get(node_name);
     }
 }
 
 pub struct Omega
 {
     config: Config,
+
     sequence_num: AtomicU32,
     incarnation: AtomicU32,
     advertise_addr: SocketAddr,
+
     leave: AtomicBool,
+    leave_chn: Sender<()>,
+    shutdown: AtomicBool,
+    shutdown_chn: Sender<()>,
+
     transport: Transport,
     awareness: Awareness,
     broadcast_queue: TransmitLimitedQueue,
+
     nodes: RwLock<Nodes>,
     num_nodes: AtomicUsize,
 }
@@ -94,19 +107,27 @@ impl Omega {
         let awareness = Awareness::new(config.awareness_max_multiplier);
         let broadcast_queue = TransmitLimitedQueue::new(config.retransmit_multiplier);
 
+        let (leave_chn, _) = tokio::sync::broadcast::channel(10);
+        let (shutdown_chn, _) = tokio::sync::broadcast::channel(10);
+
+
         let omega = Omega {
             config,
             sequence_num: AtomicU32::new(0),
             incarnation: AtomicU32::new(0),
             advertise_addr,
             leave: AtomicBool::new(false),
+            leave_chn,
+            shutdown: AtomicBool::new(false),
+            shutdown_chn,
             transport,
             awareness,
             broadcast_queue,
             num_nodes: AtomicUsize::new(0),
             nodes: RwLock::new(Nodes {
                 nodes: vec![],
-                nodes_map: HashMap::new(),
+                node_map: HashMap::new(),
+                node_suspicion: HashMap::new(),
             }),
         };
         return Ok(omega);
@@ -177,11 +198,49 @@ impl Omega
 impl Omega {
     pub async fn stream_listen(&mut self)
     {
-        print!("inside stream listen");
-        return;
+        let chn = self.transport.stream_channel();
+        let shutdown_rec = self.shutdown_chn.subscribe();
+        loop {
+            tokio::select! {
+                mut stream = chn.recv() => {
+                    if let Some(s) = stream {
+                        tokio::spawn(async move {
+                            self.handle_conn(s);
+                        })
+                    }
+                }
+                _ = shutdown_rec.recv() => {
+                    return;
+                }
+            }
+        }
     }
 
-    async fn handle_conn(&self) {}
+    async fn handle_conn(&self, mut stream: TcpStream)
+    {
+        let (kind, size) = read_message_header(&mut stream).await?;
+        match kind {
+            PushPullMessage => {
+                let msg: PushPullMessage = decode_from_tcp_stream(size, &mut stream)?;
+                // Send local state to the stream
+                self.send_local_state(&mut stream, &msg);
+                // merge to local state
+            }
+            PingMessage => {}
+            _ => {}
+        }
+    }
+
+    async fn send_local_state(&self, stream: &mut TcpStream, msg: &PushPullMessage) -> io::Result<()>
+    {
+        let nodes = self.nodes.read().unwrap();
+        let out = PushPullMessage {
+            node_states: nodes.nodes.clone(),
+            join: msg.join,
+        };
+        let _ = encode_to_tcp_stream(PushPullMessage, &out, stream).await?;
+        return Ok(());
+    }
 }
 
 // State changes
@@ -264,6 +323,16 @@ impl Omega {
             }
         }
         nodes.upsert_node(state);
+    }
+
+    fn suspect_node(suspect: &DeadMessage)
+    {
+
+    }
+
+    fn dead_node(dead: &DeadMessage)
+    {
+
     }
 
     fn refute(&self, state: &mut NodeState, accused_inc: u32)

@@ -16,5 +16,5 @@ async fn test_omega_create()
     };
 
     let o = Omega::new(config).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(10)).await
+    tokio::time::sleep(Duration::from_millis(1)).await
 }
