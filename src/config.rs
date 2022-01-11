@@ -8,6 +8,9 @@ pub struct Config {
     pub dead_node_reclaim_time: Duration,
     pub retransmit_multiplier: usize,
     pub awareness_max_multiplier: u32,
+    pub suspicion_multiplier: u32,
+    pub suspicion_max_timeout_multiplier: u32,
+    pub probe_interval: Duration,
     pub advertise_host: String,
     pub advertise_port: u16,
 }
@@ -25,7 +28,7 @@ impl Config {
                 }
             }
         }
-        let addr = format!("{}:{}", self.advertise_host, self.advertise_port);
+        let addr = format!("{}:{}", self.advertise_host, port);
         return SocketAddr::from_str(addr.as_str()).unwrap();
     }
 }

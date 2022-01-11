@@ -1,15 +1,11 @@
 use std::collections::HashSet;
-use std::future::Future;
-use std::ops::Sub;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::time;
-use tokio::time::Sleep;
 
 pub struct Suspicion
 {
@@ -26,18 +22,20 @@ pub struct Suspicion
 
 impl Suspicion
 {
-    pub fn new(from: String,
+    pub fn new<F>(from: String,
                total_confirm: u32,
                min: Duration,
                max: Duration,
-               timeout_fn: fn() -> dyn Future<Output=()>) -> Suspicion
+               timeout_fn: F) -> Suspicion
+    where
+        F: FnOnce() + Send + 'static
     {
         let mut timeout = max.clone();
         if total_confirm < 1 {
             timeout = min.clone();
         }
 
-        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
         let tx1 = tx.clone();
         let mut rx1 = tx.subscribe();
 
@@ -48,7 +46,7 @@ impl Suspicion
 
         tokio::spawn(async move {
             rx1.recv().await;
-            timeout_fn().await;
+            timeout_fn();
         });
 
         let mut confirmations = HashSet::new();
@@ -70,7 +68,7 @@ impl Suspicion
     fn calc_remaining_time(&self, elapsed: Duration) -> Duration
     {
         let n = self.num_confirm.load(Relaxed);
-        let frac = ((n + 1) as f64).log2() / ((k + 1) as f64).log2();
+        let frac = ((n + 1) as f64).log2() / ((self.total_confirm + 1) as f64).log2();
         let mut timeout = self.max - (self.max - self.min).mul_f64(frac);
 
         if timeout < self.min {
@@ -99,7 +97,7 @@ impl Suspicion
 
             let tx1 = self.tx.clone();
             if !timeout.is_zero() {
-                timer_handle = tokio::spawn(async move {
+                self.timer_handle = tokio::spawn(async move {
                     time::sleep(timeout).await;
                     tx1.send(());
                 });

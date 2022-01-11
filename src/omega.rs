@@ -1,30 +1,27 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
-use std::io::Error;
 use std::net::SocketAddr;
-use std::rc::Rc;
+use std::ops::Mul;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::atomic::Ordering::Relaxed;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use rand::Rng;
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::Sender;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::awareness::Awareness;
 use crate::broadcast::OmegaBroadcast;
 use crate::config::Config;
 use crate::models::{Alive, DeadMessage, decode_from_tcp_stream, encode, encode_to_tcp_stream, MessageKind, Node, NodeState, NodeStateKind, PushPullMessage, read_message_header};
-use crate::models::MessageKind::{AliveMessage, PingMessage, PushPullMessage, Unknown};
-use crate::models::NodeStateKind::{Dead, Left};
+use crate::models::MessageKind::{AliveMsg, PingMsg, PushPullMsg, SuspectMsg, DeadMsg};
+use crate::models::NodeStateKind::{Dead, Left, Suspect};
 use crate::queue::TransmitLimitedQueue;
 use crate::suspicion::Suspicion;
 use crate::transport::Transport;
+use crate::util::suspicion_timeout;
 
 struct Nodes
 {
@@ -88,15 +85,26 @@ pub struct Omega
 impl Omega {
     pub async fn new(config: Config) -> io::Result<Omega>
     {
-        let mut omega = Self::create_omega(config).await?;
+        let mut omega: Omega = Self::create_omega(config).await?;
         omega.set_alive()?;
 
-        let mut omega_ref = Arc::new(AtomicPtr::new(&mut omega));
+        let omega_ptr = omega.create_atomic_ptr();
         tokio::spawn(async move {
-            let o = unsafe { omega_ref.load(Relaxed).as_mut().unwrap() };
+            let o = Self::load_atomic_ptr(omega_ptr);
             o.stream_listen().await;
         });
+
         return Ok(omega);
+    }
+
+    pub fn create_atomic_ptr(&mut self) -> Arc<AtomicPtr<Omega>>
+    {
+        return Arc::new(AtomicPtr::new(self));
+    }
+
+    pub fn load_atomic_ptr<'a>(ptr: Arc<AtomicPtr<Omega>>) -> &'a mut Omega
+    {
+        return unsafe { ptr.load(Relaxed).as_mut().unwrap() };
     }
 
     async fn create_omega(config: Config) -> io::Result<Omega>
@@ -145,6 +153,11 @@ impl Omega {
         return Ok(());
     }
 
+    fn get_num_nodes(&self) -> usize
+    {
+        return self.num_nodes.load(Relaxed);
+    }
+
     fn refresh_advertise(&self) -> io::Result<SocketAddr>
     {
         return Ok(self.transport.find_advertise_addr()?);
@@ -174,7 +187,7 @@ impl Omega
                                               node: String,
                                               kind: MessageKind,
                                               msg: &T,
-                                              notify: Option<UnboundedSender<()>>)
+                                              notify: Option<Sender<()>>)
         where
             T: Serialize
     {
@@ -187,7 +200,7 @@ impl Omega
         }
     }
 
-    fn queue_broadcast(&self, node: String, msg: Vec<u8>, notify: Option<UnboundedSender<()>>)
+    fn queue_broadcast(&self, node: String, msg: Vec<u8>, notify: Option<Sender<()>>)
     {
         let broadcast = OmegaBroadcast::new(node, msg, notify);
         self.broadcast_queue.queue_broadcast(Arc::new(broadcast));
@@ -198,15 +211,18 @@ impl Omega
 impl Omega {
     pub async fn stream_listen(&mut self)
     {
+        let omega_ptr = self.create_atomic_ptr();
         let chn = self.transport.stream_channel();
-        let shutdown_rec = self.shutdown_chn.subscribe();
+        let mut shutdown_rec = self.shutdown_chn.subscribe();
         loop {
             tokio::select! {
-                mut stream = chn.recv() => {
+                stream = chn.recv() => {
                     if let Some(s) = stream {
+                        let omega_ptr_clone = omega_ptr.clone();
                         tokio::spawn(async move {
-                            self.handle_conn(s);
-                        })
+                            let o = Self::load_atomic_ptr(omega_ptr_clone);
+                            o.handle_conn(s);
+                        });
                     }
                 }
                 _ = shutdown_rec.recv() => {
@@ -218,15 +234,16 @@ impl Omega {
 
     async fn handle_conn(&self, mut stream: TcpStream)
     {
-        let (kind, size) = read_message_header(&mut stream).await?;
+        let (kind, size) = read_message_header(&mut stream).await.unwrap();
+
         match kind {
-            PushPullMessage => {
-                let msg: PushPullMessage = decode_from_tcp_stream(size, &mut stream)?;
+            PushPullMsg => {
+                let msg: PushPullMessage = decode_from_tcp_stream(size, &mut stream).await.unwrap();
                 // Send local state to the stream
-                self.send_local_state(&mut stream, &msg);
+                self.send_local_state(&mut stream, &msg).await;
                 // merge to local state
             }
-            PingMessage => {}
+            PingMsg => {}
             _ => {}
         }
     }
@@ -238,7 +255,7 @@ impl Omega {
             node_states: nodes.nodes.clone(),
             join: msg.join,
         };
-        let _ = encode_to_tcp_stream(PushPullMessage, &out, stream).await?;
+        let _ = encode_to_tcp_stream(PushPullMsg, &out, stream).await?;
         return Ok(());
     }
 }
@@ -260,7 +277,7 @@ impl Omega {
         return self.incarnation.fetch_add(offset, Ordering::Acquire);
     }
 
-    fn alive_node(&mut self, alive: Alive, bootstrap: bool, notify: Option<UnboundedSender<()>>)
+    fn alive_node(&mut self, alive: Alive, bootstrap: bool, notify: Option<Sender<()>>)
     {
         let mut nodes = self.nodes.write().unwrap();
 
@@ -274,8 +291,8 @@ impl Omega {
 
         if let Some(node_state) = nodes.get_node(&alive.node) {
             if alive.addr != node_state.node.addr {
-                let can_reclaim = self.config.dead_node_reclaim_time > Duration::ZERO
-                    && self.config.dead_node_reclaim_time <= Instant::now().duration_since(node_state.state_change);
+                let can_reclaim = self.config.dead_node_reclaim_time > Duration::ZERO &&
+                    self.config.dead_node_reclaim_time <= SystemTime::now().duration_since(node_state.state_change).unwrap();
 
                 if node_state.state == Left
                     || (node_state.state == Dead && can_reclaim) {
@@ -294,7 +311,7 @@ impl Omega {
                 },
                 state: Dead,
                 incarnation: alive.incarnation,
-                state_change: Instant::now(),
+                state_change: SystemTime::now(),
             };
 
             nodes.upsert_node(state.clone());
@@ -310,29 +327,131 @@ impl Omega {
 
         // Todo - Clear out any suspicion timer
         if is_local_node && !bootstrap {
-            self.refute(&mut state, alive.incarnation)
+            self.refute(&mut state, alive.incarnation);
         } else {
             // broadcast and notify
-            self.encode_broadcast_and_notify(state.get_name(), AliveMessage, &alive, notify);
+            self.encode_broadcast_and_notify(state.get_name(), AliveMsg, &alive, notify);
 
             state.incarnation = alive.incarnation;
             state.node.addr = alive.addr;
             if state.state != NodeStateKind::Alive {
                 state.state = NodeStateKind::Alive;
-                state.state_change = Instant::now();
+                state.state_change = SystemTime::now();
             }
         }
         nodes.upsert_node(state);
     }
 
-    fn suspect_node(suspect: &DeadMessage)
+    fn suspect_node(&mut self, suspect: &DeadMessage)
     {
+        let omega_ptr = self.create_atomic_ptr();
+        let mut nodes = self.nodes.write().unwrap();
+        let res = nodes.node_map.get_mut(&suspect.node);
+        if res.is_none() {
+            return;
+        }
 
+        let mut state = res.unwrap();
+        if suspect.incarnation < state.incarnation {
+            return;
+        }
+
+        if let Some(suspicion) = nodes.node_suspicion.get_mut(&state.get_name()) {
+            if suspicion.confirm(state.node.name.clone()) {
+                self.encode_and_broadcast(state.get_name(), SuspectMsg, suspect);
+            }
+        }
+
+        if state.state != NodeStateKind::Alive {
+            return;
+        }
+
+        if state.get_name() == self.config.node {
+            self.refute(state, state.incarnation);
+            return;
+        } else {
+            self.encode_and_broadcast(state.get_name(), SuspectMsg, suspect);
+        }
+
+        state.incarnation = suspect.incarnation;
+        state.state = Suspect;
+        let change_time = SystemTime::now();
+        state.state_change = change_time;
+
+        let mut total_confirm = self.config.suspicion_multiplier - 2;
+        let num_nodes = self.get_num_nodes() as u32;
+        if num_nodes - 2 < total_confirm {
+            total_confirm = 0;
+        }
+
+        let min = suspicion_timeout(self.config.suspicion_multiplier, num_nodes, self.config.probe_interval);
+        let max = min.mul(self.config.suspicion_max_timeout_multiplier);
+
+        let suspect_node = suspect.node.clone();
+        let timeout_fn = move || {
+            let omega = Self::load_atomic_ptr(omega_ptr);
+            let nodes = omega.nodes.read().unwrap();
+            let mut dead_msg = None;
+            if let Some(node_state) = nodes.get_node(&suspect_node) {
+                if node_state.state == Suspect && node_state.state_change == change_time {
+                    dead_msg = Some(DeadMessage {
+                        incarnation: node_state.incarnation,
+                        node: node_state.get_name(),
+                        from: omega.config.node.clone(),
+                    })
+                }
+            }
+            drop(nodes);
+
+            if dead_msg.is_some() {
+                omega.dead_node(&dead_msg.unwrap());
+            }
+        };
+
+        nodes.node_suspicion.insert(
+            state.get_name(),
+            Suspicion::new(suspect.from.clone(), total_confirm, min, max, timeout_fn));
     }
 
-    fn dead_node(dead: &DeadMessage)
+    fn dead_node(&self, dead: &DeadMessage)
     {
+        let mut nodes = self.nodes.write().unwrap();
+        let res = nodes.node_map.get_mut(&dead.node);
+        if res.is_none() {
+            return;
+        }
 
+        let mut state = res.unwrap();
+        if dead.incarnation < state.incarnation {
+            return;
+        }
+
+        nodes.node_suspicion.remove(&dead.node);
+
+        if state.dead_or_left() {
+            return;
+        }
+
+        if state.node.name == self.config.node {
+            if !self.is_left() {
+                self.refute(state, dead.incarnation);
+                return;
+            }
+
+            self.encode_broadcast_and_notify(dead.node.clone(), DeadMsg, dead, Some(self.leave_chn.clone()));
+        } else {
+            self.encode_and_broadcast(dead.node.clone(), DeadMsg, dead);
+        }
+
+        state.incarnation = dead.incarnation;
+
+        if dead.node == dead.from {
+            state.state = Left;
+        } else {
+            state.state = Dead;
+        }
+
+        state.state_change = SystemTime::now();
     }
 
     fn refute(&self, state: &mut NodeState, accused_inc: u32)
@@ -353,6 +472,6 @@ impl Omega {
         };
 
         // encode and broadcast
-        self.encode_and_broadcast(state.get_name(), AliveMessage, &alive);
+        self.encode_and_broadcast(state.get_name(), AliveMsg, &alive);
     }
 }

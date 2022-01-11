@@ -43,7 +43,7 @@ fn assert_lb_order(min: LimitedBroadcast, max: LimitedBroadcast)
 #[test]
 fn test_queue_broadcast()
 {
-    let mut queue = TransmitLimitedQueue::new(1);
+    let queue = TransmitLimitedQueue::new(1);
 
     let broadcast1 = Arc::new(DummyBroadcast::new_with_msg(String::from("msg1")));
     let broadcast2 = Arc::new(DummyBroadcast::new_with_msg(String::from("msg2")));
@@ -73,7 +73,7 @@ fn test_queue_broadcast()
 #[test]
 fn test_get_broadcast()
 {
-    let mut queue = TransmitLimitedQueue::new(1);
+    let queue = TransmitLimitedQueue::new(1);
     let broadcast1 = Arc::new(DummyBroadcast::new_with_msg(String::from("msg1")));
     let broadcast2 = Arc::new(DummyBroadcast::new_with_msg(String::from("msg2")));
     let broadcast3 = Arc::new(DummyBroadcast::new_with_msg(String::from("msg3")));

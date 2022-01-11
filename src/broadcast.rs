@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::broadcast::Sender;
 
 pub trait Broadcast: Any
 {
@@ -13,18 +13,18 @@ pub trait Broadcast: Any
 
 pub struct DummyBroadcast
 {
-    msg: Option<String>
+    msg: Option<String>,
 }
 
 impl DummyBroadcast {
     pub fn new() -> DummyBroadcast
     {
-        return DummyBroadcast{msg: None};
+        return DummyBroadcast { msg: None };
     }
 
     pub fn new_with_msg(m: String) -> DummyBroadcast
     {
-        return DummyBroadcast{msg: Some(m)};
+        return DummyBroadcast { msg: Some(m) };
     }
 }
 
@@ -41,7 +41,7 @@ impl Broadcast for DummyBroadcast {
             Err(_) => {
                 false
             }
-        }
+        };
     }
 
     fn message(&self) -> Arc<Vec<u8>> {
@@ -63,18 +63,18 @@ impl Broadcast for DummyBroadcast {
 pub struct OmegaBroadcast {
     node: String,
     msg: Arc<Vec<u8>>,
-    notify: Option<UnboundedSender<()>>
+    notify: Option<Sender<()>>,
 }
 
 impl OmegaBroadcast {
     pub fn new(node: String,
                msg: Vec<u8>,
-               notify: Option<UnboundedSender<()>>) -> OmegaBroadcast {
+               notify: Option<Sender<()>>) -> OmegaBroadcast {
         return OmegaBroadcast {
             node,
             msg: Arc::new(msg),
-            notify
-        }
+            notify,
+        };
     }
 }
 
@@ -92,7 +92,7 @@ impl Broadcast for OmegaBroadcast {
             Err(_) => {
                 false
             }
-        }
+        };
     }
 
     fn message(&self) -> Arc<Vec<u8>>
