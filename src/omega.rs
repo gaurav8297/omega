@@ -1,8 +1,9 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::ops::Mul;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, SystemTime};
@@ -15,9 +16,20 @@ use tokio::sync::broadcast::Sender;
 use crate::awareness::Awareness;
 use crate::broadcast::OmegaBroadcast;
 use crate::config::Config;
-use crate::models::{Alive, DeadMessage, decode_from_tcp_stream, encode, encode_to_tcp_stream, MessageKind, Node, NodeState, NodeStateKind, PushPullMessage, read_message_header};
-use crate::models::MessageKind::{AliveMsg, PingMsg, PushPullMsg, SuspectMsg, DeadMsg};
-use crate::models::NodeStateKind::{Dead, Left, Suspect};
+use crate::models::{
+    AliveMessage,
+    DeadMessage,
+    decode_from_tcp_stream,
+    encode,
+    encode_to_tcp_stream,
+    MessageKind,
+    Node,
+    NodeState,
+    NodeStateKind,
+    PushPullMessage,
+    read_message_header};
+use crate::models::MessageKind::{AliveMsg, DeadMsg, PingMsg, PushPullMsg, SuspectMsg};
+use crate::models::NodeStateKind::{Alive, Dead, Left, Suspect};
 use crate::queue::TransmitLimitedQueue;
 use crate::suspicion::Suspicion;
 use crate::transport::Transport;
@@ -25,39 +37,62 @@ use crate::util::suspicion_timeout;
 
 struct Nodes
 {
-    nodes: Vec<NodeState>,
-    node_map: HashMap<String, NodeState>,
-    node_suspicion: HashMap<String, Suspicion>,
+    nodes: Vec<RefCell<NodeState>>,
+    node_map: HashMap<String, RefCell<NodeState>>,
 }
 
 impl Nodes {
-    fn upsert_node(&mut self, node: NodeState)
+    #[inline]
+    fn insert_node(&mut self, node: NodeState)
     {
-        if let Some(old_state) = self.get_node(&node.get_name()) {
-            if let Some(pos) = self.nodes.iter().position(|x| *x == old_state.clone()) {
-                self.nodes.remove(pos);
-            }
+        if let Some(state) = self.get(&node.get_name()) {
+            panic!("Node already present with name {}", state.node.name);
         }
 
+        let nodes_ref = RefCell::new(node.clone());
         let n = self.nodes.len();
-        self.node_map.insert(node.get_name(), node.clone());
-        self.nodes.push(node.clone());
+
+        self.node_map.insert(node.get_name(), nodes_ref.clone());
+        self.nodes.push(nodes_ref.clone());
 
         if n > 0 {
             let offset = rand::thread_rng().gen_range(0..n);
             self.nodes.swap(offset, n);
         }
-        return;
     }
 
+    #[inline]
+    fn get_mut(&mut self, name: &String) -> Option<&mut NodeState>
+    {
+        return self.node_map.get_mut(name)
+            .map(|node_ref| node_ref.get_mut());
+    }
+
+    #[inline]
+    fn get(&self, name: &String) -> Option<NodeState>
+    {
+        return self.node_map.get(name)
+            .map(|node_ref| node_ref.borrow().clone());
+    }
+
+    #[inline]
+    fn contains(&self, name: &String) -> bool
+    {
+        return self.node_map.get(name).is_some();
+    }
+
+    #[inline]
+    fn get_vec(&self) -> Vec<NodeState>
+    {
+        return self.nodes.iter()
+            .map(|node_ref| node_ref.borrow().clone())
+            .collect();
+    }
+
+    #[inline]
     fn len(&self) -> usize
     {
         return self.nodes.len();
-    }
-
-    fn get_node(&self, node_name: &String) -> Option<&NodeState>
-    {
-        return self.node_map.get(node_name);
     }
 }
 
@@ -79,6 +114,7 @@ pub struct Omega
     broadcast_queue: TransmitLimitedQueue,
 
     nodes: RwLock<Nodes>,
+    node_suspicion: RwLock<HashMap<String, Suspicion>>,
     num_nodes: AtomicUsize,
 }
 
@@ -118,7 +154,6 @@ impl Omega {
         let (leave_chn, _) = tokio::sync::broadcast::channel(10);
         let (shutdown_chn, _) = tokio::sync::broadcast::channel(10);
 
-
         let omega = Omega {
             config,
             sequence_num: AtomicU32::new(0),
@@ -131,12 +166,12 @@ impl Omega {
             transport,
             awareness,
             broadcast_queue,
-            num_nodes: AtomicUsize::new(0),
             nodes: RwLock::new(Nodes {
                 nodes: vec![],
                 node_map: HashMap::new(),
-                node_suspicion: HashMap::new(),
             }),
+            node_suspicion: RwLock::new(HashMap::new()),
+            num_nodes: AtomicUsize::new(0),
         };
         return Ok(omega);
     }
@@ -144,12 +179,12 @@ impl Omega {
     fn set_alive(&mut self) -> io::Result<()>
     {
         let addr = self.refresh_advertise()?;
-        let alive = Alive {
+        let alive = AliveMessage {
             incarnation: self.next_incarnation(),
             node: self.config.node.clone(),
             addr,
         };
-        self.alive_node(alive, true, None);
+        self.alive_node(&alive, true, None);
         return Ok(());
     }
 
@@ -252,7 +287,7 @@ impl Omega {
     {
         let nodes = self.nodes.read().unwrap();
         let out = PushPullMessage {
-            node_states: nodes.nodes.clone(),
+            node_states: nodes.get_vec(),
             join: msg.join,
         };
         let _ = encode_to_tcp_stream(PushPullMsg, &out, stream).await?;
@@ -277,33 +312,20 @@ impl Omega {
         return self.incarnation.fetch_add(offset, Ordering::Acquire);
     }
 
-    fn alive_node(&mut self, alive: Alive, bootstrap: bool, notify: Option<Sender<()>>)
+    fn alive_node(&self, alive: &AliveMessage, bootstrap: bool, notify: Option<Sender<()>>)
     {
         let mut nodes = self.nodes.write().unwrap();
+        let mut node_suspicion = self.node_suspicion.write().unwrap();
 
         let mut update_nodes = false;
         let is_local_node = alive.node == self.config.node.clone();
-        let mut state;
 
         if self.is_left() && is_local_node {
             return;
         }
 
-        if let Some(node_state) = nodes.get_node(&alive.node) {
-            if alive.addr != node_state.node.addr {
-                let can_reclaim = self.config.dead_node_reclaim_time > Duration::ZERO &&
-                    self.config.dead_node_reclaim_time <= SystemTime::now().duration_since(node_state.state_change).unwrap();
-
-                if node_state.state == Left
-                    || (node_state.state == Dead && can_reclaim) {
-                    update_nodes = true;
-                } else {
-                    return;
-                }
-            }
-            state = node_state.clone();
-        } else {
-            state = NodeState {
+        if nodes.contains(&alive.node) {
+            let state = NodeState {
                 node: Node {
                     name: alive.node.clone(),
                     addr: alive.addr,
@@ -314,7 +336,22 @@ impl Omega {
                 state_change: SystemTime::now(),
             };
 
-            nodes.upsert_node(state.clone());
+            nodes.insert_node(state);
+            self.num_nodes.fetch_add(1, Relaxed);
+        }
+
+        let state = nodes.get_mut(&alive.node).unwrap();
+
+        if alive.addr != state.node.addr {
+            let can_reclaim = self.config.dead_node_reclaim_time > Duration::ZERO &&
+                self.config.dead_node_reclaim_time <= SystemTime::now().duration_since(state.state_change).unwrap();
+
+            if state.state == Left
+                || (state.state == Dead && can_reclaim) {
+                update_nodes = true;
+            } else {
+                return;
+            }
         }
 
         if alive.incarnation <= state.incarnation && !is_local_node && !update_nodes {
@@ -325,9 +362,11 @@ impl Omega {
             return;
         }
 
-        // Todo - Clear out any suspicion timer
+        // Clear out any suspicion timer
+        node_suspicion.remove(&alive.node);
+
         if is_local_node && !bootstrap {
-            self.refute(&mut state, alive.incarnation);
+            self.refute(state, alive.incarnation);
         } else {
             // broadcast and notify
             self.encode_broadcast_and_notify(state.get_name(), AliveMsg, &alive, notify);
@@ -339,30 +378,31 @@ impl Omega {
                 state.state_change = SystemTime::now();
             }
         }
-        nodes.upsert_node(state);
     }
 
     fn suspect_node(&mut self, suspect: &DeadMessage)
     {
         let omega_ptr = self.create_atomic_ptr();
         let mut nodes = self.nodes.write().unwrap();
-        let res = nodes.node_map.get_mut(&suspect.node);
-        if res.is_none() {
+        let mut node_suspicion = self.node_suspicion.write().unwrap();
+
+        let optional_state = nodes.get_mut(&suspect.node);
+        if optional_state.is_none() {
             return;
         }
 
-        let mut state = res.unwrap();
+        let mut state = optional_state.unwrap();
         if suspect.incarnation < state.incarnation {
             return;
         }
 
-        if let Some(suspicion) = nodes.node_suspicion.get_mut(&state.get_name()) {
-            if suspicion.confirm(state.node.name.clone()) {
+        if let Some(suspicion) = node_suspicion.get_mut(&state.get_name()) {
+            if suspicion.confirm(state.get_name()) {
                 self.encode_and_broadcast(state.get_name(), SuspectMsg, suspect);
             }
         }
 
-        if state.state != NodeStateKind::Alive {
+        if state.state != Alive {
             return;
         }
 
@@ -392,7 +432,7 @@ impl Omega {
             let omega = Self::load_atomic_ptr(omega_ptr);
             let nodes = omega.nodes.read().unwrap();
             let mut dead_msg = None;
-            if let Some(node_state) = nodes.get_node(&suspect_node) {
+            if let Some(node_state) = nodes.get(&suspect_node) {
                 if node_state.state == Suspect && node_state.state_change == change_time {
                     dead_msg = Some(DeadMessage {
                         incarnation: node_state.incarnation,
@@ -408,7 +448,7 @@ impl Omega {
             }
         };
 
-        nodes.node_suspicion.insert(
+        node_suspicion.insert(
             state.get_name(),
             Suspicion::new(suspect.from.clone(), total_confirm, min, max, timeout_fn));
     }
@@ -416,7 +456,9 @@ impl Omega {
     fn dead_node(&self, dead: &DeadMessage)
     {
         let mut nodes = self.nodes.write().unwrap();
-        let res = nodes.node_map.get_mut(&dead.node);
+        let mut node_suspicion = self.node_suspicion.write().unwrap();
+
+        let res = nodes.get_mut(&dead.node);
         if res.is_none() {
             return;
         }
@@ -426,7 +468,7 @@ impl Omega {
             return;
         }
 
-        nodes.node_suspicion.remove(&dead.node);
+        node_suspicion.remove(&dead.node);
 
         if state.dead_or_left() {
             return;
@@ -465,7 +507,7 @@ impl Omega {
 
         self.awareness.apply_delta(1);
 
-        let alive = Alive {
+        let alive = AliveMessage {
             incarnation: inc,
             node: state.get_name(),
             addr: state.get_addr(),
@@ -473,5 +515,37 @@ impl Omega {
 
         // encode and broadcast
         self.encode_and_broadcast(state.get_name(), AliveMsg, &alive);
+    }
+
+    fn merge_state(&mut self, remote_states: Vec<NodeState>)
+    {
+        remote_states.iter().for_each(|state| {
+            match state.state {
+                Alive => {
+                    let alive = AliveMessage {
+                        incarnation: state.incarnation,
+                        node: state.get_name(),
+                        addr: state.get_addr(),
+                    };
+                    self.alive_node(&alive, false, None);
+                }
+                Suspect | Dead => {
+                    let suspect = DeadMessage {
+                        incarnation: state.incarnation,
+                        node: state.get_name(),
+                        from: state.get_name(),
+                    };
+                    self.suspect_node(&suspect);
+                }
+                Left => {
+                    let dead = DeadMessage {
+                        incarnation: state.incarnation,
+                        node: state.get_name(),
+                        from: state.get_name(),
+                    };
+                    self.suspect_node(&dead);
+                }
+            }
+        });
     }
 }

@@ -78,7 +78,7 @@ impl From<u8> for MessageKind
 
 /// Alive message
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct Alive {
+pub struct AliveMessage {
     pub incarnation: u32,
     pub node: String,
     pub addr: SocketAddr,
